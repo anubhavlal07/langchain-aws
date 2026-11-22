@@ -16,7 +16,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.checkpoint.base import Checkpoint, empty_checkpoint, uuid6
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 
 from langgraph_checkpoint_aws.checkpoint.agentcore.constants import (
     CheckpointReadLimitError,
@@ -671,3 +671,43 @@ class TestAgentCoreChunkedWrites:
         assert sorted(restored.pending_writes) == sorted(
             (f"task-{i:03d}", "result", i) for i in range(150)
         )
+
+
+class _AnswersState(TypedDict, total=False):
+    answers: list[str]
+
+
+class TestAgentCoreRepeatedInterrupts:
+    @pytest.mark.parametrize("checkpoint_format", ["legacy", "snapshot"])
+    def test_resume_after_repeated_subgraph_interrupts(
+        self,
+        memory_case: MemoryCase,
+        checkpoint_format: Literal["legacy", "snapshot"],
+    ) -> None:
+        def ask(state: _AnswersState) -> _AnswersState:
+            answers = state.get("answers") or []
+            return {"answers": [*answers, interrupt(f"Q{len(answers) + 1}?")]}
+
+        inner = StateGraph(_AnswersState)
+        inner.add_node("ask", ask)
+        inner.add_edge(START, "ask")
+        inner.add_conditional_edges(
+            "ask", lambda s: "ask" if len(s["answers"]) < 3 else END
+        )
+        agent = inner.compile(checkpointer=True)
+
+        outer = StateGraph(_AnswersState)
+        outer.add_node("node", lambda s: {"answers": agent.invoke({})["answers"]})
+        outer.add_edge(START, "node")
+        outer.add_edge("node", END)
+        graph = outer.compile(
+            checkpointer=memory_case.saver(checkpoint_format=checkpoint_format)
+        )
+        config = memory_case.config(f"repeated-interrupts-{checkpoint_format}")
+
+        graph.invoke({}, config)
+        graph.invoke(Command(resume="A1"), config)
+        graph.invoke(Command(resume="A2"), config)
+        result = graph.invoke(Command(resume="A3"), config)
+
+        assert result["answers"] == ["A1", "A2", "A3"]
