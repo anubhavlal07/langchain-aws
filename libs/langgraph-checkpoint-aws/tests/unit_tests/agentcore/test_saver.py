@@ -11,7 +11,7 @@ import time
 import warnings
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Literal, TypedDict
 from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 import pytest
@@ -22,6 +22,8 @@ from langgraph.checkpoint.base import Checkpoint, CheckpointMetadata, Checkpoint
 from langgraph.checkpoint.serde import types as _serde_types
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.constants import TASKS
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 
 from langgraph_checkpoint_aws.checkpoint.agentcore.constants import (
     EMPTY_CHANNEL_VALUE,
@@ -376,6 +378,60 @@ class TestAgentCoreMemorySaver:
             "tasks": "tasks_value",
         }
         mock_boto_client.list_events.assert_called()
+
+    @pytest.mark.parametrize("checkpoint_format", ["legacy", "snapshot"])
+    def test_resume_after_repeated_subgraph_interrupts(
+        self,
+        mock_boto_client: Mock,
+        memory_id: str,
+        checkpoint_format: Literal["legacy", "snapshot"],
+    ) -> None:
+        sessions: dict[str, list[dict[str, Any]]] = {}
+
+        def create_event(**kwargs: Any) -> dict[str, Any]:
+            sessions.setdefault(kwargs["sessionId"], []).append(kwargs)
+            return {}
+
+        def list_events(**kwargs: Any) -> dict[str, Any]:
+            return {"events": list(reversed(sessions.get(kwargs["sessionId"], [])))}
+
+        mock_boto_client.create_event.side_effect = create_event
+        mock_boto_client.list_events.side_effect = list_events
+
+        class State(TypedDict, total=False):
+            answers: list[str]
+
+        def ask(state: State) -> State:
+            answers = state.get("answers") or []
+            return {"answers": [*answers, interrupt(f"Q{len(answers) + 1}?")]}
+
+        inner = StateGraph(State)
+        inner.add_node("ask", ask)
+        inner.add_edge(START, "ask")
+        inner.add_conditional_edges(
+            "ask", lambda s: "ask" if len(s["answers"]) < 3 else END
+        )
+        agent = inner.compile(checkpointer=True)
+
+        outer = StateGraph(State)
+        outer.add_node("node", lambda s: {"answers": agent.invoke({})["answers"]})
+        outer.add_edge(START, "node")
+        outer.add_edge("node", END)
+        with patch("boto3.client", return_value=mock_boto_client):
+            saver = AgentCoreMemorySaver(
+                memory_id=memory_id, checkpoint_format=checkpoint_format
+            )
+        graph = outer.compile(checkpointer=saver)
+        config = RunnableConfig(
+            configurable={"thread_id": "thread-1", "actor_id": "actor-1"}
+        )
+
+        graph.invoke({}, config)
+        graph.invoke(Command(resume="A1"), config)
+        graph.invoke(Command(resume="A2"), config)
+        result = graph.invoke(Command(resume="A3"), config)
+
+        assert result["answers"] == ["A1", "A2", "A3"]
 
     @pytest.mark.parametrize("limit", [None, 1])
     def test_get_tuple_no_checkpoints(
@@ -2512,6 +2568,37 @@ class TestEventProcessor:
         assert tuple_result.checkpoint["id"] == "checkpoint_123"
         assert len(tuple_result.pending_writes) == 1
         assert tuple_result.checkpoint["channel_values"]["default"] == "test_value"
+
+    def test_build_checkpoint_tuple_keeps_newest_special_write_per_task(
+        self,
+        processor,
+        sample_checkpoint_event,
+    ):
+        writes = [
+            WriteItem(task_id="task_1", channel="__interrupt__", value="newer"),
+            WriteItem(task_id="task_1", channel="__resume__", value=["A1"]),
+            WriteItem(task_id="task_1", channel="answers", value="b"),
+            WriteItem(task_id="task_2", channel="__interrupt__", value="other"),
+            WriteItem(task_id="task_1", channel="__interrupt__", value="older"),
+            WriteItem(task_id="task_1", channel="answers", value="a"),
+        ]
+        config = CheckpointerConfig(
+            thread_id="test_thread",
+            actor_id="test_actor",
+            checkpoint_ns="test_ns",
+        )
+
+        tuple_result = processor.build_checkpoint_tuple(
+            sample_checkpoint_event, writes, {}, config
+        )
+
+        assert tuple_result.pending_writes == [
+            ("task_1", "__interrupt__", "newer"),
+            ("task_1", "__resume__", ["A1"]),
+            ("task_1", "answers", "b"),
+            ("task_2", "__interrupt__", "other"),
+            ("task_1", "answers", "a"),
+        ]
 
     @requires_delta_snapshot
     def test_build_checkpoint_tuple_does_not_patch_delta_snapshot_seed(

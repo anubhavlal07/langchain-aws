@@ -19,6 +19,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langgraph.checkpoint.base import (
+    WRITES_IDX_MAP,
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
@@ -588,9 +589,15 @@ class EventProcessor:
     ) -> CheckpointTuple:
         """Build a CheckpointTuple from processed data."""
         # Build pending writes
-        pending_writes = [
-            (write.task_id, write.channel, write.value) for write in writes
-        ]
+        pending_writes = []
+        seen_special_writes: set[tuple[str, str]] = set()
+        for write in writes:
+            if write.channel in WRITES_IDX_MAP:
+                key = (write.task_id, write.channel)
+                if key in seen_special_writes:
+                    continue
+                seen_special_writes.add(key)
+            pending_writes.append((write.task_id, write.channel, write.value))
         # Check if there are interrupts in pending writes
         has_interrupts = pending_writes and any(
             write[1] == "__interrupt__" and write[2] for write in pending_writes
